@@ -6,7 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class Product extends Model
 {
-    // (Si tienes código previo aquí como $fillable o $guarded, déjalo intacto)
+    // Esta es la línea mágica que libera los campos (incluyendo el stock)
+    protected $guarded = []; 
 
     // 1. Relación: Un producto pertenece a una categoría
     public function category()
@@ -14,7 +15,7 @@ class Product extends Model
         return $this->belongsTo(Category::class);
     }
 
-    // 2. Relación: Un producto tiene muchos lotes de inventario (lo agregamos de una vez)
+    // 2. Relación: Un producto tiene muchos lotes de inventario
     public function batches()
     {
         return $this->hasMany(ProductBatch::class);

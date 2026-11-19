@@ -1,7 +1,8 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Api;
 
+use App\Http\Controllers\Controller;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\Product;
@@ -13,24 +14,36 @@ class SaleController extends Controller
 {
     public function store(Request $request)
     {
-        // 1. Validación básica de los datos enviados por el frontend
+        // 1. Validación exacta y alineada con el frontend de Vue
         $request->validate([
             'method' => 'required|string',
-            'received' => 'required|numeric',
-            'change' => 'required|numeric',
-            'items' => 'required|array'
+            'received' => 'required|numeric|min:0',
+            'change' => 'required|numeric|min:0',
+            'exchange_rate' => 'nullable|numeric|gt:0',
+            
+            // Aceptamos explícitamente "final" o "custom"
+            'customer_type' => 'required|string|in:final,custom',
+            
+            // Obligatorios solo si es custom, pero permitimos nulos si es final
+            'customer_doc' => 'required_if:customer_type,custom|nullable|string',
+            'customer_name' => 'required_if:customer_type,custom|nullable|string',
+            'customer_address' => 'nullable|string',
+            
+            // Validación de items simple y directa
+            'items' => 'required|array|min:1',
+            'items.*.id' => 'nullable', 
+            'items.*.product_name' => 'required|string',
+            'items.*.quantity' => 'required|numeric|min:1',
+            'items.*.price_usd' => 'required|numeric|min:0',
         ]);
 
-        // Iniciamos una transacción: Si algo falla, se deshacen todos los cambios en la BD
         DB::beginTransaction();
 
         try {
             $customerId = null;
 
-            // 2. Manejo Híbrido del Cliente (Factura Fiscal vs Consumidor Final)
+            // 2. Gestión de Cliente (Solo si es Factura Fiscal)
             if ($request->customer_type === 'custom') {
-                // updateOrCreate busca por company_id y document_id. 
-                // Si lo encuentra, actualiza el nombre/dirección. Si no, lo crea.
                 $customer = Customer::updateOrCreate(
                     [
                         'company_id' => $request->user()->company_id,
@@ -44,16 +57,15 @@ class SaleController extends Controller
                 $customerId = $customer->id;
             }
 
-            // Variables para recalcular el total en el backend por seguridad
             $totalUsd = 0;
             $exchangeRate = $request->exchange_rate ?? 36.42; 
 
-            // 3. Crear el registro principal de la Venta
+            // 3. Crear Venta
             $sale = Sale::create([
                 'company_id' => $request->user()->company_id,
                 'user_id' => $request->user()->id,
-                'customer_id' => $customerId, // Si fue anónimo, esto será null
-                'total_usd' => 0, // Lo actualizaremos en el paso 5
+                'customer_id' => $customerId,
+                'total_usd' => 0, 
                 'total_bs' => 0,
                 'exchange_rate' => $exchangeRate,
                 'payment_method' => $request->method,
@@ -62,37 +74,62 @@ class SaleController extends Controller
                 'status' => 'completed'
             ]);
 
-            // 4. Procesar los Productos (Items) y descontar Inventario
+            // 4. Procesar Items y Lógica FIFO
             foreach ($request->items as $item) {
-                // Buscamos el producto en BD para usar su precio real (evita hackeos desde el frontend)
-                $product = Product::findOrFail($item['id']);
-                
-                $subtotalUsd = $product->price * $item['quantity'];
+                $product = null;
+                $productId = $item['id'] ?? null;
+                $priceUsd = $item['price_usd']; // Tomamos el precio del payload por defecto
+
+                if ($productId) {
+                    $product = Product::findOrFail($productId);
+                    $priceUsd = $product->price; // Sobrescribimos con el precio real por seguridad
+                    
+                    // Solo descontamos si NO es un producto manual
+                    if (!$product->is_manual) {
+                        $qtyToDeduct = $item['quantity'];
+                        
+                        // Buscamos los lotes disponibles (FIFO)
+                        $batches = $product->batches()
+                            ->where('stock', '>', 0)
+                            ->orderBy('created_at', 'asc')
+                            ->lockForUpdate()
+                            ->get();
+
+                        foreach ($batches as $batch) {
+                            if ($qtyToDeduct <= 0) break; 
+
+                            if ($batch->stock >= $qtyToDeduct) {
+                                $batch->stock -= $qtyToDeduct;
+                                $batch->save();
+                                $qtyToDeduct = 0;
+                            } else {
+                                $qtyToDeduct -= $batch->stock;
+                                $batch->stock = 0;
+                                $batch->save();
+                            }
+                        }
+                    }
+                }
+
+                $subtotalUsd = $priceUsd * $item['quantity'];
                 $totalUsd += $subtotalUsd;
                 
+                // 5. Guardar el detalle de la venta
                 SaleItem::create([
                     'sale_id' => $sale->id,
-                    'product_id' => $product->id,
+                    'product_id' => $product?->id,
+                    'product_name' => $product?->name ?? $item['product_name'],
                     'quantity' => $item['quantity'],
-                    'price_usd' => $product->price,
-                    'subtotal_usd' => $subtotalUsd,
+                    'price_usd' => $priceUsd,
                 ]);
-
-                // Descontar del inventario solo si es un producto físico (no manual)
-                if (!$product->is_manual) {
-                    // Evitamos que el stock baje de cero
-                    $newStock = max(0, $product->stock - $item['quantity']);
-                    $product->update(['stock' => $newStock]);
-                }
             }
 
-            // 5. Actualizar los totales reales en la venta
+            // 6. Actualizar totales finales
             $sale->update([
                 'total_usd' => $totalUsd,
                 'total_bs' => $totalUsd * $exchangeRate
             ]);
 
-            // Todo salió perfecto, guardamos los cambios en la BD definitivamente
             DB::commit();
 
             return response()->json([
@@ -101,7 +138,6 @@ class SaleController extends Controller
             ], 201);
 
         } catch (\Exception $e) {
-            // Hubo un error (ej. se cayó la BD), deshacemos todo para no dejar datos corruptos
             DB::rollBack();
             return response()->json([
                 'error' => 'Error procesando la venta',
