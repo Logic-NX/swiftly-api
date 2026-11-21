@@ -19,4 +19,5 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/dashboard/stats', [DashboardController::class, 'getStats']);
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/customers/search/{document_id}', [App\Http\Controllers\Api\CustomerController::class, 'search']);
+    Route::post('/purchases', [App\Http\Controllers\PurchaseController::class, 'store']);
 });
